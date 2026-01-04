@@ -1,5 +1,8 @@
 ﻿using System;
 using System.IO;
+using DbMetaTool.Database;
+using DbMetaTool.Scripts;
+using DbMetaTool.Services;
 
 namespace DbMetaTool
 {
@@ -81,12 +84,12 @@ namespace DbMetaTool
         /// </summary>
         public static void BuildDatabase(string databaseDirectory, string scriptsDirectory)
         {
-            // TODO:
-            // 1) Utwórz pustą bazę danych FB 5.0 w katalogu databaseDirectory.
-            // 2) Wczytaj i wykonaj kolejno skrypty z katalogu scriptsDirectory
-            //    (tylko domeny, tabele, procedury).
-            // 3) Obsłuż błędy i wyświetl raport.
-            throw new NotImplementedException();
+
+            var firebirdConnection = new FirebirdConnection();
+            var scriptParser = new SqlScriptParser();
+            var databaseBuilder = new DatabaseBuilder(firebirdConnection, scriptParser);
+
+            databaseBuilder.Build(databaseDirectory, scriptsDirectory);
         }
 
         /// <summary>
@@ -94,11 +97,13 @@ namespace DbMetaTool
         /// </summary>
         public static void ExportScripts(string connectionString, string outputDirectory)
         {
-            // TODO:
-            // 1) Połącz się z bazą danych przy użyciu connectionString.
-            // 2) Pobierz metadane domen, tabel (z kolumnami) i procedur.
-            // 3) Wygeneruj pliki .sql / .json / .txt w outputDirectory.
-            throw new NotImplementedException();
+
+            var firebirdConnection = new FirebirdConnection();
+            var metadataExtractor = new MetadataExtractor(firebirdConnection);
+            var scriptGenerator = new SqlScriptGenerator();
+            var scriptExporter = new ScriptExporter(metadataExtractor, scriptGenerator);
+
+            scriptExporter.Export(connectionString, outputDirectory);
         }
 
         /// <summary>
@@ -106,11 +111,13 @@ namespace DbMetaTool
         /// </summary>
         public static void UpdateDatabase(string connectionString, string scriptsDirectory)
         {
-            // TODO:
-            // 1) Połącz się z bazą danych przy użyciu connectionString.
-            // 2) Wykonaj skrypty z katalogu scriptsDirectory (tylko obsługiwane elementy).
-            // 3) Zadbaj o poprawną kolejność i bezpieczeństwo zmian.
-            throw new NotImplementedException();
+
+            var firebirdConnection = new FirebirdConnection();
+            var metadataExtractor = new MetadataExtractor(firebirdConnection);
+            var scriptParser = new SqlScriptParser();
+            var databaseUpdater = new DatabaseUpdater(metadataExtractor, scriptParser, firebirdConnection);
+
+            databaseUpdater.Update(connectionString, scriptsDirectory);
         }
     }
 }
