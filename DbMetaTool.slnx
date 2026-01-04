@@ -1,3 +1,4 @@
 <Solution>
+  <Project Path="DbMetaTool.Test/DbMetaTool.Test.csproj" Id="d6e26a46-fdf9-4ccb-8672-8532619d552c" />
   <Project Path="DbMetaTool/DbMetaTool.csproj" />
 </Solution>
