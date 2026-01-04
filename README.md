@@ -69,3 +69,7 @@ Skrypty SQL muszą być zorganizowane w następującej strukturze katalogów:
 Każdy skrypt powinien:
 - Zawierać kompletną definicję obiektu (domena, tabela, procedura)
 - Być nazwany według konwencji: `<nazwa_obiektu>.sql`
+
+### Przykłady skryptów
+
+Przykładowe skrypty można znaleźć w katalogu `TestData`.
