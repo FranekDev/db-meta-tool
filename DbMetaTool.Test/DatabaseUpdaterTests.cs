@@ -248,7 +248,7 @@ namespace DbMetaTool.Test
         }
 
         [Test]
-        public void Update_WithExistingProcedure_DropsAndRecreates()
+        public void Update_WithExistingProcedure_UsesCreateOrAlter()
         {
             var tempScriptsDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
             var connectionString = "Server=localhost;Database=test.fdb";
@@ -283,11 +283,11 @@ namespace DbMetaTool.Test
 
                 _mockConnection.Verify(c => c.ExecuteNonQuery(
                     connectionString,
-                    "DROP PROCEDURE GET_USER;"), Times.Once);
+                    It.Is<string>(s => s.Contains("DROP PROCEDURE"))), Times.Never);
 
                 _mockConnection.Verify(c => c.ExecuteNonQuery(
                     connectionString,
-                    "CREATE PROCEDURE GET_USER AS BEGIN SELECT 1; END;"), Times.Once);
+                    "CREATE OR ALTER PROCEDURE GET_USER AS BEGIN SELECT 1; END;"), Times.Once);
             }
             finally
             {
@@ -351,12 +351,10 @@ namespace DbMetaTool.Test
 
                 _updater.Update(connectionString, tempScriptsDir);
 
-                Assert.That(executionOrder[0], Does.Contain("DROP PROCEDURE"));
-                Assert.That(executionOrder[1], Does.Contain("DROP TABLE"));
-                Assert.That(executionOrder[2], Does.Contain("DROP DOMAIN"));
-                Assert.That(executionOrder[3], Does.Contain("CREATE DOMAIN"));
-                Assert.That(executionOrder[4], Does.Contain("CREATE TABLE"));
-                Assert.That(executionOrder[5], Does.Contain("CREATE PROCEDURE"));
+                Assert.That(executionOrder.Count, Is.EqualTo(3));
+                Assert.That(executionOrder[0], Does.Contain("ALTER DOMAIN"));
+                Assert.That(executionOrder[1], Does.Contain("ALTER TABLE"));
+                Assert.That(executionOrder[2], Does.Contain("CREATE OR ALTER PROCEDURE"));
             }
             finally
             {

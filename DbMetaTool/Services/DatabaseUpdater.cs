@@ -1,9 +1,12 @@
 using DbMetaTool.Database;
+using DbMetaTool.Models;
+using DbMetaTool.Models.Changes;
 using DbMetaTool.Scripts;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace DbMetaTool.Services
@@ -13,6 +16,8 @@ namespace DbMetaTool.Services
         private readonly IMetadataExtractor _metadataExtractor;
         private readonly IScriptParser _scriptParser;
         private readonly IFirebirdConnection _firebirdConnection;
+        private readonly SqlDefinitionParser _definitionParser;
+        private readonly SchemaComparer _schemaComparer;
 
         public DatabaseUpdater(
             IMetadataExtractor metadataExtractor,
@@ -22,6 +27,8 @@ namespace DbMetaTool.Services
             _metadataExtractor = metadataExtractor ?? throw new ArgumentNullException(nameof(metadataExtractor));
             _scriptParser = scriptParser ?? throw new ArgumentNullException(nameof(scriptParser));
             _firebirdConnection = firebirdConnection ?? throw new ArgumentNullException(nameof(firebirdConnection));
+            _definitionParser = new SqlDefinitionParser();
+            _schemaComparer = new SchemaComparer();
         }
 
         public void Update(string connectionString, string scriptsDirectory)
@@ -54,6 +61,7 @@ namespace DbMetaTool.Services
 
             Console.WriteLine("Krok 2: Parsowanie skryptów z katalogu...");
             var parsedScripts = _scriptParser.ParseScriptsFromDirectory(scriptsDirectory);
+            ParseScriptsToObjects(parsedScripts);
             Console.WriteLine();
 
             if (parsedScripts.TotalCount == 0)
@@ -80,75 +88,140 @@ namespace DbMetaTool.Services
             Console.WriteLine("=== ZAKOŃCZONO AKTUALIZACJĘ BAZY DANYCH POMYŚLNIE ===");
         }
 
+        private void ParseScriptsToObjects(ParsedScripts parsedScripts)
+        {
+            foreach (var script in parsedScripts.DomainScripts)
+            {
+                try
+                {
+                    var domain = _definitionParser.ParseDomainScript(script);
+                    parsedScripts.ParsedDomains.Add(domain);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  Ostrzeżenie: Nie można sparsować domeny: {ex.Message}");
+                }
+            }
+
+            foreach (var script in parsedScripts.TableScripts)
+            {
+                try
+                {
+                    var table = _definitionParser.ParseTableScript(script);
+                    parsedScripts.ParsedTables.Add(table);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"  Ostrzeżenie: Nie można sparsować tabeli: {ex.Message}");
+                }
+            }
+
+            Console.WriteLine($"  Sparsowano {parsedScripts.ParsedDomains.Count} domen, {parsedScripts.ParsedTables.Count} tabel, {parsedScripts.ProcedureScripts.Count} procedur");
+        }
+
         private DatabaseChanges AnalyzeChanges(
-            List<Models.Domain> existingDomains,
-            List<Models.Table> existingTables,
-            List<Models.Procedure> existingProcedures,
+            List<Domain> existingDomains,
+            List<Table> existingTables,
+            List<Procedure> existingProcedures,
             ParsedScripts parsedScripts)
         {
             var changes = new DatabaseChanges();
 
-            var existingDomainNames = new HashSet<string>(existingDomains.Select(d => d.Name), StringComparer.OrdinalIgnoreCase);
-            var existingTableNames = new HashSet<string>(existingTables.Select(t => t.Name), StringComparer.OrdinalIgnoreCase);
-            var existingProcedureNames = new HashSet<string>(existingProcedures.Select(p => p.Name), StringComparer.OrdinalIgnoreCase);
+            var domainChanges = _schemaComparer.CompareDomains(existingDomains, parsedScripts.ParsedDomains);
+
+            var domainScriptsMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var domain in parsedScripts.ParsedDomains)
+            {
+                var originalScript = parsedScripts.DomainScripts
+                    .FirstOrDefault(s => ExtractObjectName(s, "DOMAIN")
+                        .Equals(domain.Name, StringComparison.OrdinalIgnoreCase));
+                if (originalScript != null)
+                {
+                    domainScriptsMap[domain.Name] = originalScript;
+                }
+            }
+
+            foreach (var domain in domainChanges.DomainsToCreate)
+            {
+                if (domainScriptsMap.TryGetValue(domain.Name, out var originalScript))
+                {
+                    changes.DomainCreateScripts.Add(originalScript);
+                }
+            }
+
+            changes.DomainAlterStatements.AddRange(domainChanges.DomainsToAlter.SelectMany(d => d.AlterStatements));
+
+            var tableChanges = _schemaComparer.CompareTables(existingTables, parsedScripts.ParsedTables);
+
+            var tableScriptsMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var table in parsedScripts.ParsedTables)
+            {
+                var originalScript = parsedScripts.TableScripts
+                    .FirstOrDefault(s => ExtractObjectName(s, "TABLE")
+                        .Equals(table.Name, StringComparison.OrdinalIgnoreCase));
+                if (originalScript != null)
+                {
+                    tableScriptsMap[table.Name] = originalScript;
+                }
+            }
+
+            foreach (var table in tableChanges.TablesToCreate)
+            {
+                if (tableScriptsMap.TryGetValue(table.Name, out var originalScript))
+                {
+                    changes.TableCreateScripts.Add(originalScript);
+                }
+            }
+
+            foreach (var (tableName, columnChanges) in tableChanges.TablesToAlter)
+            {
+                foreach (var column in columnChanges.ColumnsToAdd)
+                {
+                    var addStatement = GenerateAddColumnStatement(tableName, column);
+                    changes.TableAlterStatements.Add(addStatement);
+                }
+
+                foreach (var (colName, alterStatements) in columnChanges.ColumnsToAlter)
+                {
+                    changes.TableAlterStatements.AddRange(alterStatements);
+                }
+            }
 
             foreach (var script in parsedScripts.ProcedureScripts)
             {
                 var name = ExtractObjectName(script, "PROCEDURE");
                 if (!string.IsNullOrEmpty(name))
                 {
-                    if (existingProcedureNames.Contains(name))
-                    {
-                        changes.ProceduresToDrop.Add(name);
-                        changes.ProceduresToCreate.Add(script);
-                    }
-                    else
-                    {
-                        changes.ProceduresToCreate.Add(script);
-                    }
-                }
-            }
-
-            foreach (var script in parsedScripts.TableScripts)
-            {
-                var name = ExtractObjectName(script, "TABLE");
-                if (!string.IsNullOrEmpty(name))
-                {
-                    if (existingTableNames.Contains(name))
-                    {
-                        changes.TablesToDrop.Add(name);
-                        changes.TablesToCreate.Add(script);
-                    }
-                    else
-                    {
-                        changes.TablesToCreate.Add(script);
-                    }
-                }
-            }
-
-            foreach (var script in parsedScripts.DomainScripts)
-            {
-                var name = ExtractObjectName(script, "DOMAIN");
-                if (!string.IsNullOrEmpty(name))
-                {
-                    if (existingDomainNames.Contains(name))
-                    {
-                        changes.DomainsToDrop.Add(name);
-                        changes.DomainsToCreate.Add(script);
-                    }
-                    else
-                    {
-                        changes.DomainsToCreate.Add(script);
-                    }
+                    var createOrAlterScript = ConvertToCreateOrAlter(script);
+                    changes.ProcedureScripts.Add(createOrAlterScript);
                 }
             }
 
             return changes;
         }
 
+        private string GenerateAddColumnStatement(string tableName, Column column)
+        {
+            var sb = new StringBuilder();
+            sb.Append($"ALTER TABLE {tableName} ADD {column.Name} ");
+
+            if (!string.IsNullOrWhiteSpace(column.DomainName))
+                sb.Append(column.DomainName);
+            else
+                sb.Append(column.DataType);
+
+            if (!column.IsNullable)
+                sb.Append(" NOT NULL");
+
+            if (!string.IsNullOrWhiteSpace(column.DefaultValue))
+                sb.Append($" DEFAULT {column.DefaultValue}");
+
+            return sb.ToString();
+        }
+
         private string ExtractObjectName(string script, string objectType)
         {
-            var pattern = $@"CREATE\s+{objectType}\s+(\w+)";
+            var pattern = $@"CREATE\s+(?:OR\s+ALTER\s+)?{objectType}\s+(\w+)";
             var match = Regex.Match(script, pattern, RegexOptions.IgnoreCase);
 
             if (match.Success && match.Groups.Count > 1)
@@ -159,12 +232,21 @@ namespace DbMetaTool.Services
             return string.Empty;
         }
 
+        private string ConvertToCreateOrAlter(string script)
+        {
+            return Regex.Replace(
+                script,
+                @"\bCREATE\s+PROCEDURE\b",
+                "CREATE OR ALTER PROCEDURE",
+                RegexOptions.IgnoreCase);
+        }
+
         private void PrintChangesSummary(DatabaseChanges changes)
         {
             Console.WriteLine("Wykryte zmiany:");
-            Console.WriteLine($"  Domeny:     {changes.DomainsToCreate.Count} do utworzenia/aktualizacji, {changes.DomainsToDrop.Count} do usunięcia");
-            Console.WriteLine($"  Tabele:     {changes.TablesToCreate.Count} do utworzenia/aktualizacji, {changes.TablesToDrop.Count} do usunięcia");
-            Console.WriteLine($"  Procedury:  {changes.ProceduresToCreate.Count} do utworzenia/aktualizacji, {changes.ProceduresToDrop.Count} do usunięcia");
+            Console.WriteLine($"  Domeny:     {changes.DomainCreateScripts.Count} do utworzenia, {changes.DomainAlterStatements.Count} modyfikacji");
+            Console.WriteLine($"  Tabele:     {changes.TableCreateScripts.Count} do utworzenia, {changes.TableAlterStatements.Count} modyfikacji");
+            Console.WriteLine($"  Procedury:  {changes.ProcedureScripts.Count} do utworzenia/aktualizacji");
             Console.WriteLine($"  Łączna liczba zmian: {changes.TotalChanges}");
         }
 
@@ -172,70 +254,59 @@ namespace DbMetaTool.Services
         {
             int totalExecuted = 0;
 
-            if (changes.ProceduresToDrop.Count > 0)
+            if (changes.DomainAlterStatements.Count > 0)
             {
-                Console.WriteLine($"Usuwanie {changes.ProceduresToDrop.Count} procedur(y)...");
-                foreach (var name in changes.ProceduresToDrop)
+                Console.WriteLine($"Modyfikowanie domen ({changes.DomainAlterStatements.Count} zmian)...");
+                foreach (var statement in changes.DomainAlterStatements)
                 {
-                    ExecuteSafely(connectionString, $"DROP PROCEDURE {name};", $"DROP PROCEDURE {name}");
+                    ExecuteSafely(connectionString, statement, statement);
                     totalExecuted++;
                 }
-                Console.WriteLine($"  ✓ Usunięto {changes.ProceduresToDrop.Count} procedur(y)");
+                Console.WriteLine($"  Zmodyfikowano domeny");
             }
 
-            if (changes.TablesToDrop.Count > 0)
+            if (changes.DomainCreateScripts.Count > 0)
             {
-                Console.WriteLine($"Usuwanie {changes.TablesToDrop.Count} tabel(i)...");
-                foreach (var name in changes.TablesToDrop)
-                {
-                    ExecuteSafely(connectionString, $"DROP TABLE {name};", $"DROP TABLE {name}");
-                    totalExecuted++;
-                }
-                Console.WriteLine($"  ✓ Usunięto {changes.TablesToDrop.Count} tabel(i)");
-            }
-
-            if (changes.DomainsToDrop.Count > 0)
-            {
-                Console.WriteLine($"Usuwanie {changes.DomainsToDrop.Count} domen(y)...");
-                foreach (var name in changes.DomainsToDrop)
-                {
-                    ExecuteSafely(connectionString, $"DROP DOMAIN {name};", $"DROP DOMAIN {name}");
-                    totalExecuted++;
-                }
-                Console.WriteLine($"  ✓ Usunięto {changes.DomainsToDrop.Count} domen(y)");
-            }
-
-            if (changes.DomainsToCreate.Count > 0)
-            {
-                Console.WriteLine($"Tworzenie {changes.DomainsToCreate.Count} domen(y)...");
-                foreach (var script in changes.DomainsToCreate)
+                Console.WriteLine($"Tworzenie {changes.DomainCreateScripts.Count} nowych domen...");
+                foreach (var script in changes.DomainCreateScripts)
                 {
                     ExecuteSafely(connectionString, script, "CREATE DOMAIN");
                     totalExecuted++;
                 }
-                Console.WriteLine($"  ✓ Utworzono {changes.DomainsToCreate.Count} domen(y)");
+                Console.WriteLine($"  Utworzono {changes.DomainCreateScripts.Count} domen");
             }
 
-            if (changes.TablesToCreate.Count > 0)
+            if (changes.TableCreateScripts.Count > 0)
             {
-                Console.WriteLine($"Tworzenie {changes.TablesToCreate.Count} tabel(i)...");
-                foreach (var script in changes.TablesToCreate)
+                Console.WriteLine($"Tworzenie {changes.TableCreateScripts.Count} nowych tabel...");
+                foreach (var script in changes.TableCreateScripts)
                 {
                     ExecuteSafely(connectionString, script, "CREATE TABLE");
                     totalExecuted++;
                 }
-                Console.WriteLine($"  ✓ Utworzono {changes.TablesToCreate.Count} tabel(i)");
+                Console.WriteLine($"  Utworzono {changes.TableCreateScripts.Count} tabel");
             }
 
-            if (changes.ProceduresToCreate.Count > 0)
+            if (changes.TableAlterStatements.Count > 0)
             {
-                Console.WriteLine($"Tworzenie {changes.ProceduresToCreate.Count} procedur(y)...");
-                foreach (var script in changes.ProceduresToCreate)
+                Console.WriteLine($"Modyfikowanie tabel ({changes.TableAlterStatements.Count} zmian)...");
+                foreach (var statement in changes.TableAlterStatements)
                 {
-                    ExecuteSafely(connectionString, script, "CREATE PROCEDURE");
+                    ExecuteSafely(connectionString, statement, statement);
                     totalExecuted++;
                 }
-                Console.WriteLine($"  ✓ Utworzono {changes.ProceduresToCreate.Count} procedur(y)");
+                Console.WriteLine($"  Zmodyfikowano tabele");
+            }
+
+            if (changes.ProcedureScripts.Count > 0)
+            {
+                Console.WriteLine($"Tworzenie/aktualizowanie {changes.ProcedureScripts.Count} procedur(y)...");
+                foreach (var script in changes.ProcedureScripts)
+                {
+                    ExecuteSafely(connectionString, script, "CREATE OR ALTER PROCEDURE");
+                    totalExecuted++;
+                }
+                Console.WriteLine($"  Przetworzono {changes.ProcedureScripts.Count} procedur");
             }
 
             Console.WriteLine($"Łącznie wykonano operacji: {totalExecuted}");
@@ -255,19 +326,18 @@ namespace DbMetaTool.Services
 
         private class DatabaseChanges
         {
-            public List<string> DomainsToDrop { get; set; } = new List<string>();
-            public List<string> DomainsToCreate { get; set; } = new List<string>();
+            public List<string> DomainCreateScripts { get; } = new List<string>();
+            public List<string> DomainAlterStatements { get; } = new List<string>();
 
-            public List<string> TablesToDrop { get; set; } = new List<string>();
-            public List<string> TablesToCreate { get; set; } = new List<string>();
+            public List<string> TableCreateScripts { get; } = new List<string>();
+            public List<string> TableAlterStatements { get; } = new List<string>();
 
-            public List<string> ProceduresToDrop { get; set; } = new List<string>();
-            public List<string> ProceduresToCreate { get; set; } = new List<string>();
+            public List<string> ProcedureScripts { get; } = new List<string>();
 
             public int TotalChanges =>
-                DomainsToDrop.Count + DomainsToCreate.Count +
-                TablesToDrop.Count + TablesToCreate.Count +
-                ProceduresToDrop.Count + ProceduresToCreate.Count;
+                DomainCreateScripts.Count + DomainAlterStatements.Count +
+                TableCreateScripts.Count + TableAlterStatements.Count +
+                ProcedureScripts.Count;
         }
     }
 }
